@@ -84,6 +84,7 @@ class MainWindow(QMainWindow):
         self.sdr_worker: (
             SdrCaptureWorker | None
         ) = None
+        self._experiment_stop_pending = False
 
         self.setWindowTitle(
             f"{settings.application_name} — v{settings.version}"
@@ -963,6 +964,9 @@ class MainWindow(QMainWindow):
             payload["file"],
         )
 
+        if self._experiment_stop_pending:
+            self._complete_experiment()
+
     def _on_sdr_error(
         self,
         message: str,
@@ -983,6 +987,11 @@ class MainWindow(QMainWindow):
         self,
     ) -> None:
         self.sdr_worker = None
+
+        # A worker can fail before emitting capture_stopped. Do not leave an
+        # operator-requested experiment stop waiting forever in that case.
+        if self._experiment_stop_pending:
+            self._complete_experiment()
 
     # -------- Experiment --------
 
@@ -1046,14 +1055,50 @@ class MainWindow(QMainWindow):
     def _stop_experiment(
         self,
     ) -> None:
-        if not self.database_writer.is_recording:
+        if (
+            not self.database_writer.is_recording
+            or self._experiment_stop_pending
+        ):
             return
 
         if (
             self.sdr_worker is not None
             and self.sdr_worker.isRunning()
         ):
+            self._experiment_stop_pending = True
+            self.experiment_panel.start_button.setEnabled(
+                False
+            )
+            self.experiment_panel.stop_button.setEnabled(
+                False
+            )
+            self.experiment_panel.marker_button.setEnabled(
+                False
+            )
+            self.toolbar_start_action.setEnabled(
+                False
+            )
+            self.toolbar_stop_action.setEnabled(
+                False
+            )
+            self.toolbar_mark_action.setEnabled(
+                False
+            )
+            self.statusBar().showMessage(
+                "Stopping SDR capture before saving experiment..."
+            )
             self._stop_sdr_capture()
+            return
+
+        self._complete_experiment()
+
+    def _complete_experiment(
+        self,
+    ) -> None:
+        """Close the active experiment after acquisition has stopped."""
+        if not self.database_writer.is_recording:
+            self._experiment_stop_pending = False
+            return
 
         self.event_bus.publish(
             "EXPERIMENT",
@@ -1069,7 +1114,17 @@ class MainWindow(QMainWindow):
                 MasterClock.now()
             )
         )
+        self._experiment_stop_pending = False
 
+        self.experiment_panel.start_button.setEnabled(
+            True
+        )
+        self.experiment_panel.stop_button.setEnabled(
+            False
+        )
+        self.experiment_panel.marker_button.setEnabled(
+            False
+        )
         self.toolbar_start_action.setEnabled(
             True
         )
