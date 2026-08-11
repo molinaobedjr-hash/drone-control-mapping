@@ -85,7 +85,7 @@ class ControllerPanel(QWidget):
         raw_scroll.setWidget(
             self.axis_container
         )
-        raw_scroll.setMinimumHeight(150)
+        raw_scroll.setMinimumHeight(260)
 
         self.buttons_label = QLabel(
             "No button data"
@@ -105,6 +105,7 @@ class ControllerPanel(QWidget):
             QLabel("Raw USB Axes")
         )
         gl.addWidget(raw_scroll)
+        gl.addSpacing(8)
         gl.addWidget(
             QLabel("Pressed Buttons")
         )

@@ -9,9 +9,11 @@ from datetime import datetime, timezone
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QMainWindow,
     QMessageBox,
+    QScrollArea,
     QSplitter,
     QToolBar,
     QVBoxLayout,
@@ -39,6 +41,7 @@ from dcmf.acquisition.sdr.reader import (
 )
 from dcmf.config.settings import AppSettings
 from dcmf.core.event_bus import DcmfEvent, EventBus
+from dcmf.core.guided_trials import GUIDED_ACTIONS
 from dcmf.database.writer import DatabaseWriter
 from dcmf.experiments.exporter import (
     ExperimentExportWorker,
@@ -54,6 +57,7 @@ from dcmf.gui.controller_calibration_dialog import (
 from dcmf.gui.controller_panel import ControllerPanel
 from dcmf.gui.dataset_panel import DatasetPanel
 from dcmf.gui.experiment_panel import ExperimentPanel
+from dcmf.gui.guided_trial_panel import GuidedTrialPanel
 from dcmf.gui.mavlink_panel import MavlinkPanel
 from dcmf.gui.sdr_panel import SdrPanel
 from dcmf.gui.timeline_panel import TimelinePanel
@@ -127,6 +131,7 @@ class MainWindow(QMainWindow):
         )
 
         self.experiment_panel = ExperimentPanel()
+        self.guided_trial_panel = GuidedTrialPanel()
         self.controller_panel = ControllerPanel()
         self.controller_panel.set_mapping(
             self.controller_mapping
@@ -312,15 +317,31 @@ class MainWindow(QMainWindow):
         )
 
     def _build_layout(self) -> None:
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
+        left_content = QWidget()
+        left_layout = QVBoxLayout(
+            left_content
+        )
         left_layout.addWidget(
             self.experiment_panel
+        )
+        left_layout.addWidget(
+            self.guided_trial_panel
         )
         left_layout.addWidget(
             self.controller_panel
         )
         left_layout.addStretch(1)
+
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(
+            QFrame.Shape.NoFrame
+        )
+        left_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        left_scroll.setMinimumWidth(360)
+        left_scroll.setWidget(left_content)
 
         top_right = QWidget()
         top_right_layout = QHBoxLayout(
@@ -370,7 +391,7 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(
             Qt.Orientation.Horizontal
         )
-        splitter.addWidget(left)
+        splitter.addWidget(left_scroll)
         splitter.addWidget(
             right_splitter
         )
@@ -381,6 +402,9 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(
             1,
             4,
+        )
+        splitter.setSizes(
+            [360, 1140]
         )
 
         central = QWidget()
@@ -403,6 +427,12 @@ class MainWindow(QMainWindow):
         )
         self.experiment_panel.marker_requested.connect(
             self._mark_event
+        )
+        self.guided_trial_panel.trial_started.connect(
+            self._start_guided_trial
+        )
+        self.guided_trial_panel.trial_ended.connect(
+            self._end_guided_trial
         )
 
         self.mavlink_panel.refresh_requested.connect(
@@ -1044,6 +1074,11 @@ class MainWindow(QMainWindow):
             )
             return
 
+        self.guided_trial_panel.set_recording(
+            True,
+            reset=True,
+        )
+
         try:
             package = create_experiment_package(
                 experiment_root=(
@@ -1092,6 +1127,13 @@ class MainWindow(QMainWindow):
                         )
                     ),
                     "direction": "receive_only",
+                },
+                guided_trial_configuration={
+                    "actions": list(GUIDED_ACTIONS),
+                    "target_repetitions": (
+                        self.guided_trial_panel.target_repetitions
+                    ),
+                    "labeling": "START_END_INTERVALS",
                 },
             )
             self._experiment_packages[
@@ -1159,6 +1201,13 @@ class MainWindow(QMainWindow):
         ):
             return
 
+        self.guided_trial_panel.end_active_trial(
+            automatic=True
+        )
+        self.guided_trial_panel.set_recording(
+            False
+        )
+
         if (
             self.sdr_worker is not None
             and self.sdr_worker.isRunning()
@@ -1213,6 +1262,9 @@ class MainWindow(QMainWindow):
             )
         )
         self._experiment_stop_pending = False
+        self.guided_trial_panel.set_recording(
+            False
+        )
 
         self.experiment_panel.start_button.setEnabled(
             True
@@ -1390,6 +1442,58 @@ class MainWindow(QMainWindow):
             },
         )
 
+    def _start_guided_trial(
+        self,
+        action: str,
+        trial_number: int,
+    ) -> None:
+        if not self.database_writer.is_recording:
+            return
+
+        self.event_bus.publish(
+            "OPERATOR",
+            "ACTION_START",
+            {
+                "label": f"{action}_START",
+                "action": action,
+                "phase": "START",
+                "trial_number": trial_number,
+                "target_repetitions": (
+                    self.guided_trial_panel.target_repetitions
+                ),
+                "experiment_id": (
+                    self.database_writer.active_experiment_id
+                ),
+            },
+        )
+
+    def _end_guided_trial(
+        self,
+        action: str,
+        trial_number: int,
+        automatic: bool,
+    ) -> None:
+        if not self.database_writer.is_recording:
+            return
+
+        self.event_bus.publish(
+            "OPERATOR",
+            "ACTION_END",
+            {
+                "label": f"{action}_END",
+                "action": action,
+                "phase": "END",
+                "trial_number": trial_number,
+                "target_repetitions": (
+                    self.guided_trial_panel.target_repetitions
+                ),
+                "automatic": automatic,
+                "experiment_id": (
+                    self.database_writer.active_experiment_id
+                ),
+            },
+        )
+
     # -------- Unified timeline --------
 
     def _on_event(
@@ -1468,6 +1572,20 @@ class MainWindow(QMainWindow):
                 f"{event.payload.get('iq_file', '')}"
             )
 
+        elif (
+            event.source == "OPERATOR"
+            and event.kind in {
+                "ACTION_START",
+                "ACTION_END",
+            }
+        ):
+            description = (
+                f"{event.payload.get('label', event.kind)} | "
+                f"trial {event.payload.get('trial_number', '—')}"
+            )
+            if event.payload.get("automatic"):
+                description += " | automatically closed"
+
         else:
             description = (
                 f"{event.kind}: "
@@ -1530,6 +1648,11 @@ class MainWindow(QMainWindow):
         event,
     ) -> None:
         closing_experiment_id: str | None = None
+
+        if self.database_writer.is_recording:
+            self.guided_trial_panel.end_active_trial(
+                automatic=True
+            )
 
         if (
             self.sdr_worker is not None

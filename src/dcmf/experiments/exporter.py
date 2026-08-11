@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 from PySide6.QtCore import QThread, Signal
 
+from dcmf.core.guided_trials import GUIDED_ACTIONS
 from dcmf.experiments.packaging import (
     ExperimentPackage,
     finalize_experiment_package,
@@ -151,6 +152,216 @@ def _write_json(
     temporary.replace(path)
 
 
+def _guided_trial_summary(
+    connection: sqlite3.Connection,
+    experiment_id: str,
+) -> dict[str, Any]:
+    """Pair ACTION_START/ACTION_END events into numbered trials."""
+    rows = connection.execute(
+        """
+        SELECT
+            monotonic_ns,
+            utc_ns,
+            kind,
+            payload_json
+        FROM events
+        WHERE experiment_id = ?
+          AND source = 'OPERATOR'
+          AND kind IN ('ACTION_START', 'ACTION_END')
+        ORDER BY monotonic_ns, id
+        """,
+        (experiment_id,),
+    )
+
+    pairs: dict[
+        tuple[str, int],
+        dict[str, Any],
+    ] = {}
+    action_counts: dict[
+        str,
+        dict[str, int],
+    ] = {
+        action: {
+            "started": 0,
+            "ended": 0,
+            "completed": 0,
+        }
+        for action in GUIDED_ACTIONS
+    }
+    target_repetitions: set[int] = set()
+    invalid_event_count = 0
+    duplicate_event_count = 0
+    automatic_end_count = 0
+    started_event_count = 0
+    ended_event_count = 0
+
+    for row in rows:
+        kind = str(row["kind"])
+        if kind == "ACTION_START":
+            started_event_count += 1
+            slot = "start"
+        else:
+            ended_event_count += 1
+            slot = "end"
+
+        try:
+            payload = json.loads(
+                row["payload_json"] or "{}"
+            )
+        except (TypeError, json.JSONDecodeError):
+            invalid_event_count += 1
+            continue
+
+        action = str(
+            payload.get("action") or ""
+        ).strip()
+        raw_trial_number = payload.get(
+            "trial_number",
+            payload.get("trial"),
+        )
+
+        try:
+            trial_number = int(raw_trial_number)
+        except (TypeError, ValueError):
+            invalid_event_count += 1
+            continue
+
+        if not action or trial_number < 1:
+            invalid_event_count += 1
+            continue
+
+        raw_target = payload.get(
+            "target_repetitions"
+        )
+        try:
+            target = int(raw_target)
+        except (TypeError, ValueError):
+            target = 0
+        if target > 0:
+            target_repetitions.add(target)
+
+        counts = action_counts.setdefault(
+            action,
+            {
+                "started": 0,
+                "ended": 0,
+                "completed": 0,
+            },
+        )
+        counts[
+            "started" if slot == "start" else "ended"
+        ] += 1
+
+        event_details = {
+            "label": payload.get(
+                "label",
+                f"{action}_{slot.upper()}",
+            ),
+            "monotonic_ns": row["monotonic_ns"],
+            "utc_ns": row["utc_ns"],
+            "utc_iso": _utc_iso(row["utc_ns"]),
+        }
+        if slot == "end":
+            automatic = bool(
+                payload.get("automatic", False)
+            )
+            event_details["automatic"] = automatic
+            if automatic:
+                automatic_end_count += 1
+
+        pair = pairs.setdefault(
+            (action, trial_number),
+            {
+                "action": action,
+                "trial_number": trial_number,
+                "start": None,
+                "end": None,
+            },
+        )
+        if pair[slot] is not None:
+            duplicate_event_count += 1
+        else:
+            pair[slot] = event_details
+
+    action_order = {
+        action: index
+        for index, action in enumerate(
+            GUIDED_ACTIONS
+        )
+    }
+    ordered_pairs = sorted(
+        pairs.values(),
+        key=lambda item: (
+            action_order.get(
+                item["action"],
+                len(action_order),
+            ),
+            item["action"],
+            item["trial_number"],
+        ),
+    )
+
+    complete_trial_count = 0
+    incomplete_trial_count = 0
+    trials: list[dict[str, Any]] = []
+
+    for pair in ordered_pairs:
+        start = pair["start"]
+        end = pair["end"]
+        complete = start is not None and end is not None
+        duration_ns = None
+
+        if complete:
+            complete_trial_count += 1
+            action_counts[pair["action"]][
+                "completed"
+            ] += 1
+            duration_ns = (
+                end["monotonic_ns"]
+                - start["monotonic_ns"]
+            )
+            status = "complete"
+        elif start is None:
+            incomplete_trial_count += 1
+            status = "missing_start"
+        else:
+            incomplete_trial_count += 1
+            status = "missing_end"
+
+        trials.append(
+            {
+                **pair,
+                "status": status,
+                "duration_ns": duration_ns,
+                "duration_seconds": (
+                    duration_ns / 1_000_000_000
+                    if duration_ns is not None
+                    else None
+                ),
+            }
+        )
+
+    targets = sorted(target_repetitions)
+    return {
+        "actions": list(GUIDED_ACTIONS),
+        "target_repetitions": (
+            targets[0]
+            if len(targets) == 1
+            else None
+        ),
+        "observed_target_repetitions": targets,
+        "started_event_count": started_event_count,
+        "ended_event_count": ended_event_count,
+        "complete_trial_count": complete_trial_count,
+        "incomplete_trial_count": incomplete_trial_count,
+        "automatic_end_count": automatic_end_count,
+        "invalid_event_count": invalid_event_count,
+        "duplicate_event_count": duplicate_event_count,
+        "by_action": action_counts,
+        "trials": trials,
+    }
+
+
 def export_experiment(
     database_path: Path,
     package: ExperimentPackage,
@@ -223,6 +434,10 @@ def export_experiment(
                 (package.experiment_id,),
             )
         ]
+        guided_trials = _guided_trial_summary(
+            connection,
+            package.experiment_id,
+        )
 
         duration_ns = None
         if (
@@ -253,6 +468,7 @@ def export_experiment(
             ),
             "row_counts": counts,
             "iq_files": iq_files,
+            "guided_trials": guided_trials,
             "package_directory": str(
                 package.package_directory
             ),

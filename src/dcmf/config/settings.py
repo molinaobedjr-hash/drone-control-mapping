@@ -12,7 +12,7 @@ class AppSettings:
 
     application_name: str = "Drone Control Mapping Framework"
     organization_name: str = "Aviation Lab"
-    version: str = "0.6.0"
+    version: str = "0.7.0"
 
     window_width: int = 1500
     window_height: int = 900

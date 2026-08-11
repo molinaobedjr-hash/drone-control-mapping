@@ -63,6 +63,14 @@ class ExperimentExportTests(unittest.TestCase):
             sdr_configuration={
                 "center_frequency_hz": 915_000_000,
             },
+            guided_trial_configuration={
+                "actions": [
+                    "ROLL_RIGHT",
+                    "ROLL_LEFT",
+                ],
+                "target_repetitions": 3,
+                "labeling": "START_END_INTERVALS",
+            },
         )
 
     def _create_database(self) -> Path:
@@ -138,6 +146,46 @@ class ExperimentExportTests(unittest.TestCase):
                 """,
                 (experiment_id,),
             )
+            for kind, monotonic_ns, label in (
+                (
+                    "ACTION_START",
+                    1150,
+                    "ROLL_RIGHT_START",
+                ),
+                (
+                    "ACTION_END",
+                    1175,
+                    "ROLL_RIGHT_END",
+                ),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO events (
+                        experiment_id,
+                        monotonic_ns,
+                        utc_ns,
+                        source,
+                        kind,
+                        payload_json
+                    )
+                    VALUES (?, ?, ?, 'OPERATOR', ?, ?)
+                    """,
+                    (
+                        experiment_id,
+                        monotonic_ns,
+                        monotonic_ns + 1_000,
+                        kind,
+                        json.dumps(
+                            {
+                                "label": label,
+                                "action": "ROLL_RIGHT",
+                                "trial_number": 1,
+                                "target_repetitions": 3,
+                                "automatic": False,
+                            }
+                        ),
+                    ),
+                )
             connection.execute(
                 """
                 INSERT INTO mavlink_messages (
@@ -222,6 +270,12 @@ class ExperimentExportTests(unittest.TestCase):
                 "hardware_synchronized"
             ]
         )
+        self.assertEqual(
+            session_info["guided_trials"][
+                "target_repetitions"
+            ],
+            3,
+        )
 
     def test_export_contains_only_selected_experiment(
         self,
@@ -239,7 +293,7 @@ class ExperimentExportTests(unittest.TestCase):
             {
                 "controller_samples.csv": 1,
                 "mavlink_messages.csv": 1,
-                "events.csv": 1,
+                "events.csv": 3,
                 "sdr_records.csv": 1,
             },
         )
@@ -293,6 +347,24 @@ class ExperimentExportTests(unittest.TestCase):
         self.assertEqual(
             summary["iq_files"],
             ["data/iq/target-id/capture.sc16"],
+        )
+        self.assertEqual(
+            summary["guided_trials"][
+                "complete_trial_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            summary["guided_trials"]["trials"][0][
+                "start"
+            ]["label"],
+            "ROLL_RIGHT_START",
+        )
+        self.assertEqual(
+            summary["guided_trials"]["trials"][0][
+                "end"
+            ]["label"],
+            "ROLL_RIGHT_END",
         )
 
         finalized_metadata = json.loads(

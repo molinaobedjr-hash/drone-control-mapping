@@ -113,6 +113,9 @@ def create_experiment_package(
     controller_mapping: dict[str, Any],
     mavlink_configuration: dict[str, Any],
     sdr_configuration: dict[str, Any],
+    guided_trial_configuration: (
+        dict[str, Any] | None
+    ) = None,
 ) -> ExperimentPackage:
     """Create the initial files and IQ association for an experiment."""
     started = datetime.fromtimestamp(
@@ -214,6 +217,9 @@ def create_experiment_package(
         "controller_mapping": controller_mapping,
         "mavlink": mavlink_configuration,
         "sdr": sdr_configuration,
+        "guided_trials": (
+            guided_trial_configuration or {}
+        ),
     }
     _write_json(
         package_directory / "session_info.json",
