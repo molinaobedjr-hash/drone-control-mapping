@@ -60,6 +60,9 @@ from dcmf.gui.experiment_panel import ExperimentPanel
 from dcmf.gui.guided_trial_panel import GuidedTrialPanel
 from dcmf.gui.mavlink_panel import MavlinkPanel
 from dcmf.gui.sdr_panel import SdrPanel
+from dcmf.gui.session_review_dialog import (
+    SessionReviewDialog,
+)
 from dcmf.gui.timeline_panel import TimelinePanel
 from dcmf.utils.timestamps import MasterClock
 
@@ -230,6 +233,18 @@ class MainWindow(QMainWindow):
         )
         experiment_menu.addAction(
             self.menu_stop_action
+        )
+        experiment_menu.addSeparator()
+
+        self.review_sessions_action = QAction(
+            "Review Completed Sessions...",
+            self,
+        )
+        self.review_sessions_action.triggered.connect(
+            self._open_session_review
+        )
+        experiment_menu.addAction(
+            self.review_sessions_action
         )
 
         tools_menu = self.menuBar().addMenu(
@@ -1053,6 +1068,15 @@ class MainWindow(QMainWindow):
 
     # -------- Experiment --------
 
+    def _open_session_review(
+        self,
+    ) -> None:
+        dialog = SessionReviewDialog(
+            settings=self.settings,
+            parent=self,
+        )
+        dialog.exec()
+
     def _start_experiment(
         self,
         metadata: dict,
@@ -1612,20 +1636,6 @@ class MainWindow(QMainWindow):
 
             self.dataset_panel.event_count.setText(
                 str(count)
-            )
-
-        if event.kind == "START":
-            self.dataset_panel.quality_bar.setValue(
-                25
-            )
-
-        elif event.kind == "MARKER":
-            self.dataset_panel.quality_bar.setValue(
-                min(
-                    100,
-                    self.dataset_panel.quality_bar.value()
-                    + 5,
-                )
             )
 
     def _show_about(
