@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 from PySide6.QtCore import Qt
@@ -38,6 +40,14 @@ from dcmf.acquisition.sdr.reader import (
 from dcmf.config.settings import AppSettings
 from dcmf.core.event_bus import DcmfEvent, EventBus
 from dcmf.database.writer import DatabaseWriter
+from dcmf.experiments.exporter import (
+    ExperimentExportWorker,
+    export_experiment,
+)
+from dcmf.experiments.packaging import (
+    ExperimentPackage,
+    create_experiment_package,
+)
 from dcmf.gui.controller_calibration_dialog import (
     ControllerCalibrationDialog,
 )
@@ -60,10 +70,20 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.settings = settings
+        self.logger = logging.getLogger(
+            "dcmf.experiments"
+        )
         self.event_bus = EventBus(self)
 
         self.database_writer = DatabaseWriter(
-            settings.database_path
+            settings.database_path,
+            self,
+        )
+        self.database_writer.experiment_closed.connect(
+            self._on_database_experiment_closed
+        )
+        self.database_writer.command_failed.connect(
+            self._on_database_command_failed
         )
         self.database_writer.start()
 
@@ -77,6 +97,14 @@ class MainWindow(QMainWindow):
         self._controller_sample_number = 0
         self._mavlink_message_number = 0
         self._sdr_record_number = 0
+        self._experiment_packages: dict[
+            str,
+            ExperimentPackage,
+        ] = {}
+        self._export_workers: dict[
+            str,
+            ExperimentExportWorker,
+        ] = {}
 
         self.mavlink_reader: (
             MavlinkReader | None
@@ -999,11 +1027,13 @@ class MainWindow(QMainWindow):
         self,
         metadata: dict,
     ) -> None:
+        start_timestamp = MasterClock.now()
+
         try:
             experiment_id = (
                 self.database_writer.start_experiment(
                     metadata,
-                    MasterClock.now(),
+                    start_timestamp,
                 )
             )
         except RuntimeError as exc:
@@ -1013,6 +1043,74 @@ class MainWindow(QMainWindow):
                 str(exc),
             )
             return
+
+        try:
+            package = create_experiment_package(
+                experiment_root=(
+                    self.settings.experiment_directory
+                ),
+                export_root=(
+                    self.settings.export_directory
+                ),
+                iq_root=self.settings.iq_directory,
+                experiment_id=experiment_id,
+                metadata=metadata,
+                timestamp=start_timestamp,
+                application_name=(
+                    self.settings.application_name
+                ),
+                application_version=(
+                    self.settings.version
+                ),
+                database_path=(
+                    self.settings.database_path
+                ),
+                controller_mapping=asdict(
+                    self.controller_mapping
+                ),
+                mavlink_configuration={
+                    "port": (
+                        self.mavlink_panel.current_port()
+                    ),
+                    "baud": (
+                        self.mavlink_panel.current_baud()
+                    ),
+                    "connected": bool(
+                        self.mavlink_reader is not None
+                        and self.mavlink_reader.isRunning()
+                    ),
+                    "direction": "receive_only",
+                },
+                sdr_configuration={
+                    **self.sdr_panel.capture_settings(),
+                    "auto_capture": (
+                        self.sdr_panel.auto_capture_enabled()
+                    ),
+                    "capture_backend": (
+                        uhd_backend_status().get(
+                            "rx_samples_to_file"
+                        )
+                    ),
+                    "direction": "receive_only",
+                },
+            )
+            self._experiment_packages[
+                experiment_id
+            ] = package
+        except Exception as exc:
+            self.logger.exception(
+                "Could not create package for experiment %s",
+                experiment_id,
+            )
+            QMessageBox.warning(
+                self,
+                "Experiment Packaging",
+                (
+                    "The experiment is recording in SQLite, but "
+                    "its package directory could not be created:\n\n"
+                    f"{exc}"
+                ),
+            )
 
         self.toolbar_start_action.setEnabled(
             False
@@ -1137,10 +1235,133 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(
             (
-                f"Saved experiment "
+                f"Finalizing experiment "
                 f"{completed_id[:8] if completed_id else '—'} "
-                f"to {self.settings.database_path}"
+                "and preparing exports..."
             )
+        )
+
+    def _on_database_experiment_closed(
+        self,
+        experiment_id: str,
+    ) -> None:
+        """Start exports only after SQLite commits the completed session."""
+        package = self._experiment_packages.get(
+            experiment_id
+        )
+
+        if package is None:
+            message = (
+                "SQLite saved experiment "
+                f"{experiment_id[:8]}, but no package was available "
+                "for automatic export."
+            )
+            self.logger.error(message)
+            if not self.database_writer.is_recording:
+                self.statusBar().showMessage(message)
+            return
+
+        worker = ExperimentExportWorker(
+            database_path=self.settings.database_path,
+            package=package,
+            parent=self,
+        )
+        worker.export_completed.connect(
+            self._on_export_completed
+        )
+        worker.export_failed.connect(
+            self._on_export_failed
+        )
+        worker.finished.connect(
+            lambda experiment_id=experiment_id:
+                self._on_export_worker_finished(
+                    experiment_id
+                )
+        )
+
+        self._export_workers[experiment_id] = worker
+        self.logger.info(
+            "Exporting completed experiment %s to %s",
+            experiment_id,
+            package.export_directory,
+        )
+        worker.start()
+
+    def _on_export_completed(
+        self,
+        result: dict,
+    ) -> None:
+        experiment_id = str(
+            result["experiment_id"]
+        )
+        export_directory = str(
+            result["export_directory"]
+        )
+        self.logger.info(
+            "Experiment export complete: %s -> %s",
+            experiment_id,
+            export_directory,
+        )
+
+        if not self.database_writer.is_recording:
+            self.statusBar().showMessage(
+                "Experiment saved and exported to "
+                f"{export_directory}"
+            )
+
+    def _on_export_failed(
+        self,
+        experiment_id: str,
+        message: str,
+    ) -> None:
+        self.logger.error(
+            "Experiment export failed for %s: %s",
+            experiment_id,
+            message,
+        )
+
+        if not self.database_writer.is_recording:
+            self.statusBar().showMessage(
+                "Experiment saved to SQLite; automatic export failed."
+            )
+
+        QMessageBox.warning(
+            self,
+            "Experiment Export",
+            (
+                "The experiment remains safely stored in SQLite, "
+                "but its automatic export failed:\n\n"
+                f"{message}"
+            ),
+        )
+
+    def _on_export_worker_finished(
+        self,
+        experiment_id: str,
+    ) -> None:
+        worker = self._export_workers.pop(
+            experiment_id,
+            None,
+        )
+        if worker is not None:
+            worker.deleteLater()
+        self._experiment_packages.pop(
+            experiment_id,
+            None,
+        )
+
+    def _on_database_command_failed(
+        self,
+        command: str,
+        message: str,
+    ) -> None:
+        self.logger.error(
+            "Database command failed (%s): %s",
+            command,
+            message,
+        )
+        self.statusBar().showMessage(
+            f"Database error during {command}: {message}"
         )
 
     def _mark_event(
@@ -1308,6 +1529,8 @@ class MainWindow(QMainWindow):
         self,
         event,
     ) -> None:
+        closing_experiment_id: str | None = None
+
         if (
             self.sdr_worker is not None
             and self.sdr_worker.isRunning()
@@ -1324,8 +1547,10 @@ class MainWindow(QMainWindow):
                 },
             )
 
-            self.database_writer.stop_experiment(
-                MasterClock.now()
+            closing_experiment_id = (
+                self.database_writer.stop_experiment(
+                    MasterClock.now()
+                )
             )
 
         if self.controller_reader.isRunning():
@@ -1338,4 +1563,50 @@ class MainWindow(QMainWindow):
             self.mavlink_reader.stop()
 
         self.database_writer.shutdown()
+
+        # The Qt event loop is closing, so a queued experiment_closed signal
+        # may not be delivered. Export this final session synchronously after
+        # the database writer has committed and shut down.
+        if closing_experiment_id is not None:
+            package = self._experiment_packages.pop(
+                closing_experiment_id,
+                None,
+            )
+            if package is not None:
+                try:
+                    result = export_experiment(
+                        self.settings.database_path,
+                        package,
+                    )
+                    self.logger.info(
+                        "Experiment export complete during shutdown: "
+                        "%s -> %s",
+                        closing_experiment_id,
+                        result["export_directory"],
+                    )
+                except Exception:
+                    self.logger.exception(
+                        "Experiment export failed during shutdown: %s",
+                        closing_experiment_id,
+                    )
+
+        unfinished_exports = []
+        for experiment_id, worker in list(
+            self._export_workers.items()
+        ):
+            if worker.isRunning() and not worker.wait(
+                30_000
+            ):
+                unfinished_exports.append(
+                    experiment_id
+                )
+
+        if unfinished_exports:
+            self.logger.warning(
+                "Waiting for experiment exports before closing: %s",
+                ", ".join(unfinished_exports),
+            )
+            event.ignore()
+            return
+
         event.accept()
