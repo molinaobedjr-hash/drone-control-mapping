@@ -12,15 +12,25 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from PySide6.QtCore import QObject, Signal
+
 from dcmf.core.event_bus import DcmfEvent
 from dcmf.database.schema import SCHEMA_SQL
 from dcmf.utils.timestamps import Timestamp
 
 
-class DatabaseWriter:
+class DatabaseWriter(QObject):
     """Thread-safe background SQLite recorder."""
 
-    def __init__(self, database_path: Path) -> None:
+    experiment_closed = Signal(str)
+    command_failed = Signal(str, str)
+
+    def __init__(
+        self,
+        database_path: Path,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(
             parents=True,
@@ -165,6 +175,7 @@ class DatabaseWriter:
 
             while True:
                 command, payload = self._queue.get()
+                closed_experiment_id: str | None = None
 
                 try:
                     if command == "shutdown":
@@ -189,22 +200,38 @@ class DatabaseWriter:
                             connection,
                             payload,
                         )
+                        closed_experiment_id = payload[
+                            "id"
+                        ]
 
                     connection.commit()
 
-                except Exception:
+                    if closed_experiment_id is not None:
+                        self.experiment_closed.emit(
+                            closed_experiment_id
+                        )
+
+                except Exception as exc:
                     connection.rollback()
                     self.logger.exception(
                         "Database command failed: %s",
                         command,
                     )
+                    self.command_failed.emit(
+                        command,
+                        str(exc),
+                    )
 
                 finally:
                     self._queue.task_done()
 
-        except Exception:
+        except Exception as exc:
             self.logger.exception(
                 "Database writer failed to initialize."
+            )
+            self.command_failed.emit(
+                "initialize",
+                str(exc),
             )
 
         finally:

@@ -1,29 +1,60 @@
+"""Live acquisition counters shown in the main window."""
+
 from __future__ import annotations
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QGroupBox, QFormLayout, QLabel, QProgressBar
+
+from PySide6.QtWidgets import (
+    QFormLayout,
+    QGroupBox,
+    QLabel,
+    QVBoxLayout,
+    QWidget,
+)
+
 
 class DatasetPanel(QWidget):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    """Show live counts without claiming completed-session quality."""
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
+
         self.controller_count = QLabel("0")
         self.mavlink_count = QLabel("0")
         self.sdr_count = QLabel("0")
         self.event_count = QLabel("0")
 
         form = QFormLayout()
-        form.addRow("Controller samples", self.controller_count)
-        form.addRow("MAVLink messages", self.mavlink_count)
-        form.addRow("SDR records", self.sdr_count)
-        form.addRow("Experiment markers", self.event_count)
+        form.addRow(
+            "Controller samples",
+            self.controller_count,
+        )
+        form.addRow(
+            "MAVLink messages",
+            self.mavlink_count,
+        )
+        form.addRow(
+            "SDR records",
+            self.sdr_count,
+        )
+        form.addRow(
+            "Experiment/operator events",
+            self.event_count,
+        )
 
-        self.quality_bar = QProgressBar()
-        self.quality_bar.setRange(0, 100)
-        self.quality_bar.setValue(0)
-        self.quality_bar.setFormat("Dataset readiness: %p%")
+        review_hint = QLabel(
+            "After stopping an experiment, use Experiment > "
+            "Review Completed Sessions for data-quality checks."
+        )
+        review_hint.setWordWrap(True)
 
-        group = QGroupBox("Dataset Quality")
-        gl = QVBoxLayout(group)
-        gl.addLayout(form)
-        gl.addWidget(self.quality_bar)
+        group = QGroupBox(
+            "Live Dataset Counts"
+        )
+        group_layout = QVBoxLayout(group)
+        group_layout.addLayout(form)
+        group_layout.addWidget(review_hint)
 
         layout = QVBoxLayout(self)
         layout.addWidget(group)

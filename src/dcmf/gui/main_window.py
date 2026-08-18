@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QMainWindow,
     QMessageBox,
+    QScrollArea,
     QSplitter,
     QToolBar,
     QVBoxLayout,
@@ -37,15 +41,29 @@ from dcmf.acquisition.sdr.reader import (
 )
 from dcmf.config.settings import AppSettings
 from dcmf.core.event_bus import DcmfEvent, EventBus
+from dcmf.core.guided_trials import GUIDED_ACTIONS
 from dcmf.database.writer import DatabaseWriter
+from dcmf.experiments.exporter import (
+    ExperimentExportWorker,
+    export_experiment,
+)
+from dcmf.experiments.packaging import (
+    ExperimentPackage,
+    create_experiment_package,
+)
 from dcmf.gui.controller_calibration_dialog import (
     ControllerCalibrationDialog,
 )
+from dcmf.gui.analysis_replay_dialog import AnalysisReplayDialog
 from dcmf.gui.controller_panel import ControllerPanel
 from dcmf.gui.dataset_panel import DatasetPanel
 from dcmf.gui.experiment_panel import ExperimentPanel
+from dcmf.gui.guided_trial_panel import GuidedTrialPanel
 from dcmf.gui.mavlink_panel import MavlinkPanel
 from dcmf.gui.sdr_panel import SdrPanel
+from dcmf.gui.session_review_dialog import (
+    SessionReviewDialog,
+)
 from dcmf.gui.timeline_panel import TimelinePanel
 from dcmf.utils.timestamps import MasterClock
 
@@ -60,10 +78,20 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.settings = settings
+        self.logger = logging.getLogger(
+            "dcmf.experiments"
+        )
         self.event_bus = EventBus(self)
 
         self.database_writer = DatabaseWriter(
-            settings.database_path
+            settings.database_path,
+            self,
+        )
+        self.database_writer.experiment_closed.connect(
+            self._on_database_experiment_closed
+        )
+        self.database_writer.command_failed.connect(
+            self._on_database_command_failed
         )
         self.database_writer.start()
 
@@ -77,10 +105,19 @@ class MainWindow(QMainWindow):
         self._controller_sample_number = 0
         self._mavlink_message_number = 0
         self._sdr_record_number = 0
+        self._experiment_packages: dict[
+            str,
+            ExperimentPackage,
+        ] = {}
+        self._export_workers: dict[
+            str,
+            ExperimentExportWorker,
+        ] = {}
 
         self.mavlink_reader: (
             MavlinkReader | None
         ) = None
+        self._controller_connected = False
         self.sdr_worker: (
             SdrCaptureWorker | None
         ) = None
@@ -99,6 +136,7 @@ class MainWindow(QMainWindow):
         )
 
         self.experiment_panel = ExperimentPanel()
+        self.guided_trial_panel = GuidedTrialPanel()
         self.controller_panel = ControllerPanel()
         self.controller_panel.set_mapping(
             self.controller_mapping
@@ -198,6 +236,27 @@ class MainWindow(QMainWindow):
         experiment_menu.addAction(
             self.menu_stop_action
         )
+        experiment_menu.addSeparator()
+
+        self.review_sessions_action = QAction(
+            "Review Completed Sessions...",
+            self,
+        )
+        self.review_sessions_action.triggered.connect(
+            self._open_session_review
+        )
+        experiment_menu.addAction(
+            self.review_sessions_action
+        )
+
+        self.analysis_replay_action = QAction(
+            "Analyze / Replay Sessions...",
+            self,
+        )
+        self.analysis_replay_action.triggered.connect(
+            self._open_analysis_replay
+        )
+        experiment_menu.addAction(self.analysis_replay_action)
 
         tools_menu = self.menuBar().addMenu(
             "&Tools"
@@ -284,15 +343,31 @@ class MainWindow(QMainWindow):
         )
 
     def _build_layout(self) -> None:
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
+        left_content = QWidget()
+        left_layout = QVBoxLayout(
+            left_content
+        )
         left_layout.addWidget(
             self.experiment_panel
+        )
+        left_layout.addWidget(
+            self.guided_trial_panel
         )
         left_layout.addWidget(
             self.controller_panel
         )
         left_layout.addStretch(1)
+
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(
+            QFrame.Shape.NoFrame
+        )
+        left_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        left_scroll.setMinimumWidth(360)
+        left_scroll.setWidget(left_content)
 
         top_right = QWidget()
         top_right_layout = QHBoxLayout(
@@ -342,7 +417,7 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(
             Qt.Orientation.Horizontal
         )
-        splitter.addWidget(left)
+        splitter.addWidget(left_scroll)
         splitter.addWidget(
             right_splitter
         )
@@ -353,6 +428,9 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(
             1,
             4,
+        )
+        splitter.setSizes(
+            [360, 1140]
         )
 
         central = QWidget()
@@ -376,6 +454,12 @@ class MainWindow(QMainWindow):
         self.experiment_panel.marker_requested.connect(
             self._mark_event
         )
+        self.guided_trial_panel.trial_started.connect(
+            self._start_guided_trial
+        )
+        self.guided_trial_panel.trial_ended.connect(
+            self._end_guided_trial
+        )
 
         self.mavlink_panel.refresh_requested.connect(
             self._refresh_serial_ports
@@ -385,6 +469,9 @@ class MainWindow(QMainWindow):
         )
         self.mavlink_panel.disconnect_requested.connect(
             self._disconnect_mavlink
+        )
+        self.mavlink_panel.output_enabled_changed.connect(
+            self._on_manual_control_output_requested
         )
 
         self.sdr_panel.refresh_requested.connect(
@@ -474,6 +561,7 @@ class MainWindow(QMainWindow):
         connected: bool,
         description: str,
     ) -> None:
+        self._controller_connected = connected
         self.controller_panel.set_connection(
             connected,
             description,
@@ -491,6 +579,11 @@ class MainWindow(QMainWindow):
                     description,
             },
         )
+
+        if not connected:
+            self._disable_manual_control_output(
+                "Output disabled: controller disconnected"
+            )
 
     def _on_controller_sample(
         self,
@@ -521,6 +614,15 @@ class MainWindow(QMainWindow):
             )
         }
 
+        reader = self.mavlink_reader
+        if reader is not None and reader.output_enabled:
+            try:
+                reader.set_manual_control(mapped)
+            except (TypeError, ValueError) as exc:
+                self._disable_manual_control_output(
+                    f"Output disabled: {exc}"
+                )
+
         self.event_bus.publish(
             "CONTROLLER",
             "SAMPLE",
@@ -542,6 +644,10 @@ class MainWindow(QMainWindow):
         self,
         message: str,
     ) -> None:
+        self._controller_connected = False
+        self._disable_manual_control_output(
+            "Output disabled: controller error"
+        )
         self.controller_panel.set_connection(
             False,
             message,
@@ -611,6 +717,12 @@ class MainWindow(QMainWindow):
         reader.error_occurred.connect(
             self._on_mavlink_error
         )
+        reader.output_state_changed.connect(
+            self.mavlink_panel.set_output_status
+        )
+        reader.vehicle_state_changed.connect(
+            self._on_mavlink_vehicle_state
+        )
         reader.finished.connect(
             self._on_mavlink_reader_finished
         )
@@ -631,6 +743,9 @@ class MainWindow(QMainWindow):
         if reader is None:
             return
 
+        self._disable_manual_control_output(
+            "Output disabled: MAVLink disconnected"
+        )
         reader.stop()
         self.mavlink_reader = None
 
@@ -676,6 +791,7 @@ class MainWindow(QMainWindow):
             packet.system_id,
             packet.component_id,
             packet.decoded,
+            packet.direction,
         )
 
         self.event_bus.publish(
@@ -683,7 +799,7 @@ class MainWindow(QMainWindow):
             "MESSAGE",
             {
                 "direction":
-                    "RX",
+                    packet.direction,
                 "message_name":
                     packet.message_name,
                 "message_id":
@@ -724,6 +840,92 @@ class MainWindow(QMainWindow):
             False,
             "Disconnected",
         )
+
+    def _on_mavlink_vehicle_state(
+        self,
+        state: dict,
+    ) -> None:
+        armed = state.get("armed")
+        self.mavlink_panel.set_vehicle_state(
+            state.get("system_id"),
+            state.get("component_id"),
+            armed,
+        )
+        if armed is True and self.mavlink_panel.output_checkbox.isChecked():
+            self._disable_manual_control_output(
+                "Output disabled: vehicle reports ARMED"
+            )
+
+    def _on_manual_control_output_requested(
+        self,
+        enabled: bool,
+    ) -> None:
+        reader = self.mavlink_reader
+        if not enabled:
+            if reader is not None:
+                reader.set_output_enabled(False)
+            self.mavlink_panel.set_output_status("Output disabled")
+            if self.database_writer.is_recording:
+                self.event_bus.publish(
+                    "MAVLINK",
+                    "CONTROL_OUTPUT_DISABLED",
+                    {"protocol": "MANUAL_CONTROL"},
+                )
+            return
+
+        problems = []
+        if reader is None or not reader.isRunning():
+            problems.append("connect the telemetry radio")
+        if not self.database_writer.is_recording:
+            problems.append("start an experiment")
+        if not self._controller_connected:
+            problems.append("connect the TX16S USB joystick")
+        if not self.controller_mapping.complete:
+            problems.append("complete the DCMF controller mapping")
+        if reader is not None and reader.target_system_id is None:
+            problems.append("wait for a vehicle heartbeat")
+        if reader is not None and reader.vehicle_armed is True:
+            problems.append("disarm the vehicle")
+
+        if problems:
+            message = "Cannot enable MANUAL_CONTROL output. Please " + "; ".join(
+                problems
+            ) + "."
+            self.mavlink_panel.set_output_checked(False)
+            self.mavlink_panel.set_output_status(message)
+            QMessageBox.warning(self, "MANUAL_CONTROL Output", message)
+            return
+
+        assert reader is not None
+        reader.set_output_enabled(True)
+        self.event_bus.publish(
+            "MAVLINK",
+            "CONTROL_OUTPUT_ENABLED",
+            {
+                "protocol": "MANUAL_CONTROL",
+                "rate_hz": 20,
+                "target_system_id": reader.target_system_id,
+                "armed_guard": True,
+                "buttons_transmitted": False,
+            },
+        )
+
+    def _disable_manual_control_output(self, reason: str) -> None:
+        reader = self.mavlink_reader
+        was_enabled = bool(reader is not None and reader.output_enabled)
+        if reader is not None:
+            reader.set_output_enabled(False)
+        self.mavlink_panel.set_output_checked(False)
+        self.mavlink_panel.set_output_status(reason)
+        if was_enabled and self.database_writer.is_recording:
+            self.event_bus.publish(
+                "MAVLINK",
+                "CONTROL_OUTPUT_DISABLED",
+                {
+                    "protocol": "MANUAL_CONTROL",
+                    "reason": reason,
+                },
+            )
 
     # -------- SDR --------
 
@@ -995,15 +1197,33 @@ class MainWindow(QMainWindow):
 
     # -------- Experiment --------
 
+    def _open_session_review(
+        self,
+    ) -> None:
+        dialog = SessionReviewDialog(
+            settings=self.settings,
+            parent=self,
+        )
+        dialog.exec()
+
+    def _open_analysis_replay(self) -> None:
+        dialog = AnalysisReplayDialog(
+            settings=self.settings,
+            parent=self,
+        )
+        dialog.exec()
+
     def _start_experiment(
         self,
         metadata: dict,
     ) -> None:
+        start_timestamp = MasterClock.now()
+
         try:
             experiment_id = (
                 self.database_writer.start_experiment(
                     metadata,
-                    MasterClock.now(),
+                    start_timestamp,
                 )
             )
         except RuntimeError as exc:
@@ -1013,6 +1233,93 @@ class MainWindow(QMainWindow):
                 str(exc),
             )
             return
+
+        self.guided_trial_panel.set_recording(
+            True,
+            reset=True,
+        )
+
+        try:
+            package = create_experiment_package(
+                experiment_root=(
+                    self.settings.experiment_directory
+                ),
+                export_root=(
+                    self.settings.export_directory
+                ),
+                iq_root=self.settings.iq_directory,
+                experiment_id=experiment_id,
+                metadata=metadata,
+                timestamp=start_timestamp,
+                application_name=(
+                    self.settings.application_name
+                ),
+                application_version=(
+                    self.settings.version
+                ),
+                database_path=(
+                    self.settings.database_path
+                ),
+                controller_mapping=asdict(
+                    self.controller_mapping
+                ),
+                mavlink_configuration={
+                    "port": (
+                        self.mavlink_panel.current_port()
+                    ),
+                    "baud": (
+                        self.mavlink_panel.current_baud()
+                    ),
+                    "connected": bool(
+                        self.mavlink_reader is not None
+                        and self.mavlink_reader.isRunning()
+                    ),
+                    "direction": "bidirectional_guarded",
+                    "manual_control": {
+                        "available": True,
+                        "enabled_at_start": False,
+                        "rate_hz": 20,
+                        "armed_guard": True,
+                        "buttons_transmitted": False,
+                    },
+                },
+                sdr_configuration={
+                    **self.sdr_panel.capture_settings(),
+                    "auto_capture": (
+                        self.sdr_panel.auto_capture_enabled()
+                    ),
+                    "capture_backend": (
+                        uhd_backend_status().get(
+                            "rx_samples_to_file"
+                        )
+                    ),
+                    "direction": "receive_only",
+                },
+                guided_trial_configuration={
+                    "actions": list(GUIDED_ACTIONS),
+                    "target_repetitions": (
+                        self.guided_trial_panel.target_repetitions
+                    ),
+                    "labeling": "START_END_INTERVALS",
+                },
+            )
+            self._experiment_packages[
+                experiment_id
+            ] = package
+        except Exception as exc:
+            self.logger.exception(
+                "Could not create package for experiment %s",
+                experiment_id,
+            )
+            QMessageBox.warning(
+                self,
+                "Experiment Packaging",
+                (
+                    "The experiment is recording in SQLite, but "
+                    "its package directory could not be created:\n\n"
+                    f"{exc}"
+                ),
+            )
 
         self.toolbar_start_action.setEnabled(
             False
@@ -1060,6 +1367,17 @@ class MainWindow(QMainWindow):
             or self._experiment_stop_pending
         ):
             return
+
+        self._disable_manual_control_output(
+            "Output disabled: experiment stopping"
+        )
+
+        self.guided_trial_panel.end_active_trial(
+            automatic=True
+        )
+        self.guided_trial_panel.set_recording(
+            False
+        )
 
         if (
             self.sdr_worker is not None
@@ -1115,6 +1433,9 @@ class MainWindow(QMainWindow):
             )
         )
         self._experiment_stop_pending = False
+        self.guided_trial_panel.set_recording(
+            False
+        )
 
         self.experiment_panel.start_button.setEnabled(
             True
@@ -1137,10 +1458,133 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(
             (
-                f"Saved experiment "
+                f"Finalizing experiment "
                 f"{completed_id[:8] if completed_id else '—'} "
-                f"to {self.settings.database_path}"
+                "and preparing exports..."
             )
+        )
+
+    def _on_database_experiment_closed(
+        self,
+        experiment_id: str,
+    ) -> None:
+        """Start exports only after SQLite commits the completed session."""
+        package = self._experiment_packages.get(
+            experiment_id
+        )
+
+        if package is None:
+            message = (
+                "SQLite saved experiment "
+                f"{experiment_id[:8]}, but no package was available "
+                "for automatic export."
+            )
+            self.logger.error(message)
+            if not self.database_writer.is_recording:
+                self.statusBar().showMessage(message)
+            return
+
+        worker = ExperimentExportWorker(
+            database_path=self.settings.database_path,
+            package=package,
+            parent=self,
+        )
+        worker.export_completed.connect(
+            self._on_export_completed
+        )
+        worker.export_failed.connect(
+            self._on_export_failed
+        )
+        worker.finished.connect(
+            lambda experiment_id=experiment_id:
+                self._on_export_worker_finished(
+                    experiment_id
+                )
+        )
+
+        self._export_workers[experiment_id] = worker
+        self.logger.info(
+            "Exporting completed experiment %s to %s",
+            experiment_id,
+            package.export_directory,
+        )
+        worker.start()
+
+    def _on_export_completed(
+        self,
+        result: dict,
+    ) -> None:
+        experiment_id = str(
+            result["experiment_id"]
+        )
+        export_directory = str(
+            result["export_directory"]
+        )
+        self.logger.info(
+            "Experiment export complete: %s -> %s",
+            experiment_id,
+            export_directory,
+        )
+
+        if not self.database_writer.is_recording:
+            self.statusBar().showMessage(
+                "Experiment saved and exported to "
+                f"{export_directory}"
+            )
+
+    def _on_export_failed(
+        self,
+        experiment_id: str,
+        message: str,
+    ) -> None:
+        self.logger.error(
+            "Experiment export failed for %s: %s",
+            experiment_id,
+            message,
+        )
+
+        if not self.database_writer.is_recording:
+            self.statusBar().showMessage(
+                "Experiment saved to SQLite; automatic export failed."
+            )
+
+        QMessageBox.warning(
+            self,
+            "Experiment Export",
+            (
+                "The experiment remains safely stored in SQLite, "
+                "but its automatic export failed:\n\n"
+                f"{message}"
+            ),
+        )
+
+    def _on_export_worker_finished(
+        self,
+        experiment_id: str,
+    ) -> None:
+        worker = self._export_workers.pop(
+            experiment_id,
+            None,
+        )
+        if worker is not None:
+            worker.deleteLater()
+        self._experiment_packages.pop(
+            experiment_id,
+            None,
+        )
+
+    def _on_database_command_failed(
+        self,
+        command: str,
+        message: str,
+    ) -> None:
+        self.logger.error(
+            "Database command failed (%s): %s",
+            command,
+            message,
+        )
+        self.statusBar().showMessage(
+            f"Database error during {command}: {message}"
         )
 
     def _mark_event(
@@ -1166,6 +1610,58 @@ class MainWindow(QMainWindow):
                     label,
                 "experiment_id":
                     self.database_writer.active_experiment_id,
+            },
+        )
+
+    def _start_guided_trial(
+        self,
+        action: str,
+        trial_number: int,
+    ) -> None:
+        if not self.database_writer.is_recording:
+            return
+
+        self.event_bus.publish(
+            "OPERATOR",
+            "ACTION_START",
+            {
+                "label": f"{action}_START",
+                "action": action,
+                "phase": "START",
+                "trial_number": trial_number,
+                "target_repetitions": (
+                    self.guided_trial_panel.target_repetitions
+                ),
+                "experiment_id": (
+                    self.database_writer.active_experiment_id
+                ),
+            },
+        )
+
+    def _end_guided_trial(
+        self,
+        action: str,
+        trial_number: int,
+        automatic: bool,
+    ) -> None:
+        if not self.database_writer.is_recording:
+            return
+
+        self.event_bus.publish(
+            "OPERATOR",
+            "ACTION_END",
+            {
+                "label": f"{action}_END",
+                "action": action,
+                "phase": "END",
+                "trial_number": trial_number,
+                "target_repetitions": (
+                    self.guided_trial_panel.target_repetitions
+                ),
+                "automatic": automatic,
+                "experiment_id": (
+                    self.database_writer.active_experiment_id
+                ),
             },
         )
 
@@ -1223,7 +1719,8 @@ class MainWindow(QMainWindow):
             )
 
             description = (
-                f"RX {event.payload.get('message_name')} "
+                f"{event.payload.get('direction', 'RX')} "
+                f"{event.payload.get('message_name')} "
                 f"sys={event.payload.get('system_id')} "
                 f"comp={event.payload.get('component_id')}"
             )
@@ -1246,6 +1743,20 @@ class MainWindow(QMainWindow):
                 f"{event.kind}: "
                 f"{event.payload.get('iq_file', '')}"
             )
+
+        elif (
+            event.source == "OPERATOR"
+            and event.kind in {
+                "ACTION_START",
+                "ACTION_END",
+            }
+        ):
+            description = (
+                f"{event.payload.get('label', event.kind)} | "
+                f"trial {event.payload.get('trial_number', '—')}"
+            )
+            if event.payload.get("automatic"):
+                description += " | automatically closed"
 
         else:
             description = (
@@ -1275,20 +1786,6 @@ class MainWindow(QMainWindow):
                 str(count)
             )
 
-        if event.kind == "START":
-            self.dataset_panel.quality_bar.setValue(
-                25
-            )
-
-        elif event.kind == "MARKER":
-            self.dataset_panel.quality_bar.setValue(
-                min(
-                    100,
-                    self.dataset_panel.quality_bar.value()
-                    + 5,
-                )
-            )
-
     def _show_about(
         self,
     ) -> None:
@@ -1298,9 +1795,10 @@ class MainWindow(QMainWindow):
             (
                 "<b>Drone Control Mapping Framework</b><br>"
                 f"Version {self.settings.version}<br><br>"
-                "Synchronized receive-only acquisition "
-                "and experiment recording for controller, "
-                "MAVLink/RFD900, SDR IQ, and operator events."
+                "Synchronized controller, MAVLink telemetry, SDR IQ, "
+                "operator-event recording, guided analysis, replay, and "
+                "ML dataset generation. Guarded MANUAL_CONTROL output is "
+                "available only for disarmed mapping tests."
             ),
         )
 
@@ -1308,6 +1806,17 @@ class MainWindow(QMainWindow):
         self,
         event,
     ) -> None:
+        closing_experiment_id: str | None = None
+
+        self._disable_manual_control_output(
+            "Output disabled: application closing"
+        )
+
+        if self.database_writer.is_recording:
+            self.guided_trial_panel.end_active_trial(
+                automatic=True
+            )
+
         if (
             self.sdr_worker is not None
             and self.sdr_worker.isRunning()
@@ -1324,8 +1833,10 @@ class MainWindow(QMainWindow):
                 },
             )
 
-            self.database_writer.stop_experiment(
-                MasterClock.now()
+            closing_experiment_id = (
+                self.database_writer.stop_experiment(
+                    MasterClock.now()
+                )
             )
 
         if self.controller_reader.isRunning():
@@ -1338,4 +1849,50 @@ class MainWindow(QMainWindow):
             self.mavlink_reader.stop()
 
         self.database_writer.shutdown()
+
+        # The Qt event loop is closing, so a queued experiment_closed signal
+        # may not be delivered. Export this final session synchronously after
+        # the database writer has committed and shut down.
+        if closing_experiment_id is not None:
+            package = self._experiment_packages.pop(
+                closing_experiment_id,
+                None,
+            )
+            if package is not None:
+                try:
+                    result = export_experiment(
+                        self.settings.database_path,
+                        package,
+                    )
+                    self.logger.info(
+                        "Experiment export complete during shutdown: "
+                        "%s -> %s",
+                        closing_experiment_id,
+                        result["export_directory"],
+                    )
+                except Exception:
+                    self.logger.exception(
+                        "Experiment export failed during shutdown: %s",
+                        closing_experiment_id,
+                    )
+
+        unfinished_exports = []
+        for experiment_id, worker in list(
+            self._export_workers.items()
+        ):
+            if worker.isRunning() and not worker.wait(
+                30_000
+            ):
+                unfinished_exports.append(
+                    experiment_id
+                )
+
+        if unfinished_exports:
+            self.logger.warning(
+                "Waiting for experiment exports before closing: %s",
+                ", ".join(unfinished_exports),
+            )
+            event.ignore()
+            return
+
         event.accept()
