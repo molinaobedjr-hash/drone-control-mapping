@@ -1,4 +1,4 @@
-"""RFD900 / MAVLink connection and live-message panel."""
+"""Telemetry-radio/MAVLink connection and live-message panel."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QComboBox,
+    QCheckBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -21,11 +22,12 @@ from dcmf.acquisition.mavlink.reader import SerialPortInfo
 
 
 class MavlinkPanel(QWidget):
-    """User controls and status for receive-only MAVLink acquisition."""
+    """User controls and status for MAVLink capture and guarded output."""
 
     connect_requested = Signal(str, int)
     disconnect_requested = Signal()
     refresh_requested = Signal()
+    output_enabled_changed = Signal(bool)
 
     def __init__(
         self,
@@ -40,6 +42,9 @@ class MavlinkPanel(QWidget):
         self.heartbeat_label = QLabel("Not observed")
         self.last_message_label = QLabel("—")
         self.message_count_label = QLabel("0")
+        self.vehicle_label = QLabel("Not observed")
+        self.output_status_label = QLabel("Output disabled")
+        self.output_status_label.setWordWrap(True)
 
         self.port_combo = QComboBox()
         self.port_combo.setMinimumWidth(230)
@@ -72,25 +77,39 @@ class MavlinkPanel(QWidget):
         connect_row.addWidget(self.connect_button)
         connect_row.addWidget(self.disconnect_button)
 
+        self.output_checkbox = QCheckBox(
+            "Transmit mapped MANUAL_CONTROL (disarmed tests only)"
+        )
+        self.output_checkbox.setEnabled(False)
+        self.output_checkbox.setToolTip(
+            "Opt-in 20 Hz MAVLink output. Requires a complete DCMF mapping, "
+            "an active experiment, a live controller, and a vehicle heartbeat. "
+            "DCMF suppresses this output while the vehicle reports ARMED."
+        )
+
         form = QFormLayout()
         form.addRow("Status", self.status_label)
         form.addRow("Serial Port", port_row)
         form.addRow("Baud", self.baud_combo)
         form.addRow("Heartbeat", self.heartbeat_label)
+        form.addRow("Vehicle", self.vehicle_label)
         form.addRow("Last Message", self.last_message_label)
         form.addRow("Messages", self.message_count_label)
+        form.addRow("Control Output", self.output_status_label)
 
         self.message_view = QPlainTextEdit()
         self.message_view.setReadOnly(True)
         self.message_view.setMaximumBlockCount(400)
         self.message_view.setPlaceholderText(
-            "Inbound decoded MAVLink messages will appear here."
+            "Decoded inbound and locally transmitted MAVLink messages "
+            "will appear here."
         )
 
-        group = QGroupBox("RFD900 / MAVLink — Receive Only")
+        group = QGroupBox("915 MHz Telemetry Radio / MAVLink")
         group_layout = QVBoxLayout(group)
         group_layout.addLayout(form)
         group_layout.addLayout(connect_row)
+        group_layout.addWidget(self.output_checkbox)
         group_layout.addWidget(self.message_view)
 
         layout = QVBoxLayout(self)
@@ -104,6 +123,9 @@ class MavlinkPanel(QWidget):
         )
         self.disconnect_button.clicked.connect(
             self.disconnect_requested.emit
+        )
+        self.output_checkbox.toggled.connect(
+            self.output_enabled_changed.emit
         )
 
     def set_ports(
@@ -166,11 +188,37 @@ class MavlinkPanel(QWidget):
         self.port_combo.setEnabled(not connected)
         self.baud_combo.setEnabled(not connected)
         self.refresh_button.setEnabled(not connected)
+        self.output_checkbox.setEnabled(connected)
 
         if not connected:
             self.heartbeat_label.setText(
                 "Not observed"
             )
+            self.vehicle_label.setText("Not observed")
+            self.set_output_checked(False)
+            self.set_output_status("Output disabled")
+
+    def set_output_checked(self, enabled: bool) -> None:
+        """Set the opt-in checkbox without recursively emitting a request."""
+        self.output_checkbox.blockSignals(True)
+        self.output_checkbox.setChecked(bool(enabled))
+        self.output_checkbox.blockSignals(False)
+
+    def set_output_status(self, message: str) -> None:
+        self.output_status_label.setText(message)
+
+    def set_vehicle_state(
+        self,
+        system_id: int | None,
+        component_id: int | None,
+        armed: bool | None,
+    ) -> None:
+        state = "ARMED" if armed else "DISARMED"
+        if armed is None:
+            state = "state unknown"
+        self.vehicle_label.setText(
+            f"SYS {system_id} / COMP {component_id} — {state}"
+        )
 
     def set_message_count(self, count: int) -> None:
         self.message_count_label.setText(str(count))
@@ -181,6 +229,7 @@ class MavlinkPanel(QWidget):
         system_id: int | None,
         component_id: int | None,
         decoded: dict,
+        direction: str = "RX",
     ) -> None:
         self.last_message_label.setText(message_name)
 
@@ -197,7 +246,7 @@ class MavlinkPanel(QWidget):
 
         self.message_view.appendPlainText(
             (
-                f"{message_name} "
+                f"{direction} {message_name} "
                 f"[sys={system_id}, comp={component_id}] "
                 f"{compact}"
             )

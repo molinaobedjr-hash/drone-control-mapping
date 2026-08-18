@@ -54,6 +54,7 @@ from dcmf.experiments.packaging import (
 from dcmf.gui.controller_calibration_dialog import (
     ControllerCalibrationDialog,
 )
+from dcmf.gui.analysis_replay_dialog import AnalysisReplayDialog
 from dcmf.gui.controller_panel import ControllerPanel
 from dcmf.gui.dataset_panel import DatasetPanel
 from dcmf.gui.experiment_panel import ExperimentPanel
@@ -116,6 +117,7 @@ class MainWindow(QMainWindow):
         self.mavlink_reader: (
             MavlinkReader | None
         ) = None
+        self._controller_connected = False
         self.sdr_worker: (
             SdrCaptureWorker | None
         ) = None
@@ -246,6 +248,15 @@ class MainWindow(QMainWindow):
         experiment_menu.addAction(
             self.review_sessions_action
         )
+
+        self.analysis_replay_action = QAction(
+            "Analyze / Replay Sessions...",
+            self,
+        )
+        self.analysis_replay_action.triggered.connect(
+            self._open_analysis_replay
+        )
+        experiment_menu.addAction(self.analysis_replay_action)
 
         tools_menu = self.menuBar().addMenu(
             "&Tools"
@@ -459,6 +470,9 @@ class MainWindow(QMainWindow):
         self.mavlink_panel.disconnect_requested.connect(
             self._disconnect_mavlink
         )
+        self.mavlink_panel.output_enabled_changed.connect(
+            self._on_manual_control_output_requested
+        )
 
         self.sdr_panel.refresh_requested.connect(
             self._refresh_sdr_devices
@@ -547,6 +561,7 @@ class MainWindow(QMainWindow):
         connected: bool,
         description: str,
     ) -> None:
+        self._controller_connected = connected
         self.controller_panel.set_connection(
             connected,
             description,
@@ -564,6 +579,11 @@ class MainWindow(QMainWindow):
                     description,
             },
         )
+
+        if not connected:
+            self._disable_manual_control_output(
+                "Output disabled: controller disconnected"
+            )
 
     def _on_controller_sample(
         self,
@@ -594,6 +614,15 @@ class MainWindow(QMainWindow):
             )
         }
 
+        reader = self.mavlink_reader
+        if reader is not None and reader.output_enabled:
+            try:
+                reader.set_manual_control(mapped)
+            except (TypeError, ValueError) as exc:
+                self._disable_manual_control_output(
+                    f"Output disabled: {exc}"
+                )
+
         self.event_bus.publish(
             "CONTROLLER",
             "SAMPLE",
@@ -615,6 +644,10 @@ class MainWindow(QMainWindow):
         self,
         message: str,
     ) -> None:
+        self._controller_connected = False
+        self._disable_manual_control_output(
+            "Output disabled: controller error"
+        )
         self.controller_panel.set_connection(
             False,
             message,
@@ -684,6 +717,12 @@ class MainWindow(QMainWindow):
         reader.error_occurred.connect(
             self._on_mavlink_error
         )
+        reader.output_state_changed.connect(
+            self.mavlink_panel.set_output_status
+        )
+        reader.vehicle_state_changed.connect(
+            self._on_mavlink_vehicle_state
+        )
         reader.finished.connect(
             self._on_mavlink_reader_finished
         )
@@ -704,6 +743,9 @@ class MainWindow(QMainWindow):
         if reader is None:
             return
 
+        self._disable_manual_control_output(
+            "Output disabled: MAVLink disconnected"
+        )
         reader.stop()
         self.mavlink_reader = None
 
@@ -749,6 +791,7 @@ class MainWindow(QMainWindow):
             packet.system_id,
             packet.component_id,
             packet.decoded,
+            packet.direction,
         )
 
         self.event_bus.publish(
@@ -756,7 +799,7 @@ class MainWindow(QMainWindow):
             "MESSAGE",
             {
                 "direction":
-                    "RX",
+                    packet.direction,
                 "message_name":
                     packet.message_name,
                 "message_id":
@@ -797,6 +840,92 @@ class MainWindow(QMainWindow):
             False,
             "Disconnected",
         )
+
+    def _on_mavlink_vehicle_state(
+        self,
+        state: dict,
+    ) -> None:
+        armed = state.get("armed")
+        self.mavlink_panel.set_vehicle_state(
+            state.get("system_id"),
+            state.get("component_id"),
+            armed,
+        )
+        if armed is True and self.mavlink_panel.output_checkbox.isChecked():
+            self._disable_manual_control_output(
+                "Output disabled: vehicle reports ARMED"
+            )
+
+    def _on_manual_control_output_requested(
+        self,
+        enabled: bool,
+    ) -> None:
+        reader = self.mavlink_reader
+        if not enabled:
+            if reader is not None:
+                reader.set_output_enabled(False)
+            self.mavlink_panel.set_output_status("Output disabled")
+            if self.database_writer.is_recording:
+                self.event_bus.publish(
+                    "MAVLINK",
+                    "CONTROL_OUTPUT_DISABLED",
+                    {"protocol": "MANUAL_CONTROL"},
+                )
+            return
+
+        problems = []
+        if reader is None or not reader.isRunning():
+            problems.append("connect the telemetry radio")
+        if not self.database_writer.is_recording:
+            problems.append("start an experiment")
+        if not self._controller_connected:
+            problems.append("connect the TX16S USB joystick")
+        if not self.controller_mapping.complete:
+            problems.append("complete the DCMF controller mapping")
+        if reader is not None and reader.target_system_id is None:
+            problems.append("wait for a vehicle heartbeat")
+        if reader is not None and reader.vehicle_armed is True:
+            problems.append("disarm the vehicle")
+
+        if problems:
+            message = "Cannot enable MANUAL_CONTROL output. Please " + "; ".join(
+                problems
+            ) + "."
+            self.mavlink_panel.set_output_checked(False)
+            self.mavlink_panel.set_output_status(message)
+            QMessageBox.warning(self, "MANUAL_CONTROL Output", message)
+            return
+
+        assert reader is not None
+        reader.set_output_enabled(True)
+        self.event_bus.publish(
+            "MAVLINK",
+            "CONTROL_OUTPUT_ENABLED",
+            {
+                "protocol": "MANUAL_CONTROL",
+                "rate_hz": 20,
+                "target_system_id": reader.target_system_id,
+                "armed_guard": True,
+                "buttons_transmitted": False,
+            },
+        )
+
+    def _disable_manual_control_output(self, reason: str) -> None:
+        reader = self.mavlink_reader
+        was_enabled = bool(reader is not None and reader.output_enabled)
+        if reader is not None:
+            reader.set_output_enabled(False)
+        self.mavlink_panel.set_output_checked(False)
+        self.mavlink_panel.set_output_status(reason)
+        if was_enabled and self.database_writer.is_recording:
+            self.event_bus.publish(
+                "MAVLINK",
+                "CONTROL_OUTPUT_DISABLED",
+                {
+                    "protocol": "MANUAL_CONTROL",
+                    "reason": reason,
+                },
+            )
 
     # -------- SDR --------
 
@@ -1077,6 +1206,13 @@ class MainWindow(QMainWindow):
         )
         dialog.exec()
 
+    def _open_analysis_replay(self) -> None:
+        dialog = AnalysisReplayDialog(
+            settings=self.settings,
+            parent=self,
+        )
+        dialog.exec()
+
     def _start_experiment(
         self,
         metadata: dict,
@@ -1138,7 +1274,14 @@ class MainWindow(QMainWindow):
                         self.mavlink_reader is not None
                         and self.mavlink_reader.isRunning()
                     ),
-                    "direction": "receive_only",
+                    "direction": "bidirectional_guarded",
+                    "manual_control": {
+                        "available": True,
+                        "enabled_at_start": False,
+                        "rate_hz": 20,
+                        "armed_guard": True,
+                        "buttons_transmitted": False,
+                    },
                 },
                 sdr_configuration={
                     **self.sdr_panel.capture_settings(),
@@ -1224,6 +1367,10 @@ class MainWindow(QMainWindow):
             or self._experiment_stop_pending
         ):
             return
+
+        self._disable_manual_control_output(
+            "Output disabled: experiment stopping"
+        )
 
         self.guided_trial_panel.end_active_trial(
             automatic=True
@@ -1572,7 +1719,8 @@ class MainWindow(QMainWindow):
             )
 
             description = (
-                f"RX {event.payload.get('message_name')} "
+                f"{event.payload.get('direction', 'RX')} "
+                f"{event.payload.get('message_name')} "
                 f"sys={event.payload.get('system_id')} "
                 f"comp={event.payload.get('component_id')}"
             )
@@ -1647,9 +1795,10 @@ class MainWindow(QMainWindow):
             (
                 "<b>Drone Control Mapping Framework</b><br>"
                 f"Version {self.settings.version}<br><br>"
-                "Synchronized receive-only acquisition "
-                "and experiment recording for controller, "
-                "MAVLink/RFD900, SDR IQ, and operator events."
+                "Synchronized controller, MAVLink telemetry, SDR IQ, "
+                "operator-event recording, guided analysis, replay, and "
+                "ML dataset generation. Guarded MANUAL_CONTROL output is "
+                "available only for disarmed mapping tests."
             ),
         )
 
@@ -1658,6 +1807,10 @@ class MainWindow(QMainWindow):
         event,
     ) -> None:
         closing_experiment_id: str | None = None
+
+        self._disable_manual_control_output(
+            "Output disabled: application closing"
+        )
 
         if self.database_writer.is_recording:
             self.guided_trial_panel.end_active_trial(

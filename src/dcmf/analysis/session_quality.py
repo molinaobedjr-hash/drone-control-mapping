@@ -505,6 +505,23 @@ def evaluate_session(
                 (SELECT COUNT(*) FROM mavlink_messages
                  WHERE experiment_id = ?
                    AND message_name = 'HEARTBEAT') AS heartbeats,
+                (SELECT COUNT(*) FROM mavlink_messages
+                 WHERE experiment_id = ?
+                   AND direction = 'TX'
+                   AND message_name = 'MANUAL_CONTROL') AS manual_control_tx,
+                (SELECT COUNT(*) FROM mavlink_messages
+                 WHERE experiment_id = ?
+                   AND direction = 'RX'
+                   AND message_name IN ('RC_CHANNELS', 'RC_CHANNELS_RAW'))
+                   AS rc_channel_rx,
+                (SELECT COUNT(*) FROM mavlink_messages
+                 WHERE experiment_id = ?
+                   AND direction = 'RX'
+                   AND message_name = 'SERVO_OUTPUT_RAW') AS servo_output_rx,
+                (SELECT COUNT(*) FROM mavlink_messages
+                 WHERE experiment_id = ?
+                   AND (raw_hex IS NULL OR trim(raw_hex) = ''))
+                   AS missing_raw_hex,
                 (SELECT COUNT(*) FROM sdr_records
                  WHERE experiment_id = ?) AS sdr_records,
                 (SELECT COUNT(*) FROM events
@@ -514,7 +531,7 @@ def evaluate_session(
                    AND source = 'OPERATOR'
                    AND kind = 'MARKER') AS manual_markers
             """,
-            (experiment_id,) * 6,
+            (experiment_id,) * 10,
         ).fetchone()
         counts = {
             key: int(count_row[key])
@@ -649,6 +666,26 @@ def evaluate_session(
         if counts["heartbeats"] > 0
         else FAIL,
         f"{counts['heartbeats']:,} HEARTBEAT messages recorded.",
+    )
+    add_check(
+        "mavlink_raw_hex",
+        "MAVLink raw bytes",
+        PASS
+        if counts["mavlink_messages"] > 0
+        and counts["missing_raw_hex"] == 0
+        else FAIL,
+        (
+            "No MAVLink messages were recorded."
+            if counts["mavlink_messages"] == 0
+            else "Every saved MAVLink message includes raw hexadecimal bytes."
+            if counts["missing_raw_hex"] == 0
+            else f"{counts['missing_raw_hex']:,} MAVLink message(s) lack raw hex."
+        ),
+        {
+            "manual_control_tx": counts["manual_control_tx"],
+            "rc_channel_rx": counts["rc_channel_rx"],
+            "servo_output_rx": counts["servo_output_rx"],
+        },
     )
 
     captures: dict[str, dict[str, Any]] = {}

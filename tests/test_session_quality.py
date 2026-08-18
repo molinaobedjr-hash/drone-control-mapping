@@ -300,7 +300,7 @@ class SessionQualityTests(unittest.TestCase):
         self.assertEqual(
             report.status_counts,
             {
-                PASS: 12,
+                PASS: 13,
                 WARNING: 0,
                 FAIL: 0,
             },

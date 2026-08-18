@@ -1,1 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
 
+# Runtime state and large captures
+/data/dcmf.sqlite3-wal
+/data/dcmf.sqlite3-shm
+/data/controller_mapping.json
+/data/iq/
+/logs/*.log
+/experiments/
+/exports/
+/analysis/
+/backups/
+
+# Editor/OS files
+.idea/
+.vscode/
+.DS_Store

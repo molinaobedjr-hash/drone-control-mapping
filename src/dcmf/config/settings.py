@@ -12,7 +12,7 @@ class AppSettings:
 
     application_name: str = "Drone Control Mapping Framework"
     organization_name: str = "Aviation Lab"
-    version: str = "0.8.0"
+    version: str = "1.0.0"
 
     window_width: int = 1500
     window_height: int = 900
@@ -20,6 +20,7 @@ class AppSettings:
     log_directory: Path = Path("logs")
     experiment_directory: Path = Path("experiments")
     export_directory: Path = Path("exports")
+    analysis_directory: Path = Path("analysis")
     database_path: Path = Path("data") / "dcmf.sqlite3"
     iq_directory: Path = Path("data") / "iq"
     controller_mapping_path: Path = (
